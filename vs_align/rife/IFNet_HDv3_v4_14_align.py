@@ -108,7 +108,7 @@ class IFNet(nn.Module):
         self.encode = Head()
 
 
-    def align_images(self, fclip, fref, flowmask, time, scales, blur, smooth, ensemble, compensate, device, fp16, fref_h_pad, fref_w_pad, flow2=None, fref_pref=None):
+    def align_images(self, fclip, fref, flowmask, time, scales, blur, smooth, ensemble, compensate, device, fp16, fref_h_pad, fref_w_pad, flow2=None, fref_pref=None, fft_flow_offset=None):
         def compute_flow(fclip_pref, fref_pref, time, fp16):
             f0, f1 = self.encode(fclip_pref[:, :3]), self.encode(fref_pref[:, :3])
             flow, mask, block = None, None, [self.block0, self.block1, self.block2, self.block3]
@@ -247,6 +247,19 @@ class IFNet(nn.Module):
         else:
             compensated_flow = flow1[:, :2]
         
+        # Subtract FFT shift offset from flow to avoid double-correction
+        # FFT already applied global translation, so RIFE should only compute residual
+        if fft_flow_offset is not None:
+            # fft_flow_offset is (shift_y, shift_x) in pixels
+            # Convert to flow tensor format (1, 2, H, W)
+            h, w = compensated_flow.shape[2], compensated_flow.shape[3]
+            offset_tensor = torch.zeros((1, 2, h, w), device=compensated_flow.device, dtype=compensated_flow.dtype)
+            # Flow convention: positive flow means "move pixel from source position"
+            # If FFT shifted clip by +shift, we need to subtract that from RIFE flow
+            offset_tensor[:, 0, :, :] = fft_flow_offset[1]  # x component
+            offset_tensor[:, 1, :, :] = fft_flow_offset[0]  # y component
+            compensated_flow = compensated_flow - offset_tensor
+        
         # resize flow to fclip's size
         compensated_flow = F.interpolate(compensated_flow, size=(fref_h, fref_w), mode="bilinear", align_corners=False)
         # Scale flow by ratio of original dimensions (not padded) to correct for padding-induced scale error
@@ -290,7 +303,8 @@ class IFNet(nn.Module):
         compensate=True,     # if True, fref will be aligned to itself and subtracted from flow. removes any inherent shift from the rife model, but halves speed.
         ensemble=True,       # computed flow from clip to ref and ref to clip and averages both to stabilize flow. much worse results when False.
         device="cuda",       # cpu or cuda.
-        fp16=False           # if True, use half precision.
+        fp16=False,          # if True, use half precision.
+        fft_flow_offset=None # (shift_y, shift_x) tuple from FFT pre-pass to subtract from RIFE flow
     ):
         fref_h_pad = fref.shape[2] + pads[0]
         fref_w_pad = fref.shape[3] + pads[1]
@@ -298,6 +312,6 @@ class IFNet(nn.Module):
         flow2      = None
         fref_pref  = None
         for _iteration in range(its):
-            aligned_fclip, flow2, fref_pref = self.align_images(fclip, fref, flowmask, time, scales, blur, smooth, ensemble, compensate, device, fp16, fref_h_pad, fref_w_pad, flow2, fref_pref)
+            aligned_fclip, flow2, fref_pref = self.align_images(fclip, fref, flowmask, time, scales, blur, smooth, ensemble, compensate, device, fp16, fref_h_pad, fref_w_pad, flow2, fref_pref, fft_flow_offset)
             fclip  = aligned_fclip  # use the aligned image as fclip for the next iteration
         return aligned_fclip

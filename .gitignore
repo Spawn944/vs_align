@@ -1,54 +1,37 @@
 ```
-# Python
-__pycache__/
+# Compiled and build artifacts
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
-venv/
+__pycache__/
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.class
+*.out
+
+# Dependencies
 .venv/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.DS_Store
-Thumbs.db
-
-# Virtual Environment variables
+venv/
 .env
-.venv
-env/
+.env.local
+*.env.*
 
-# IDE
-.vscode/
-.idea/
+# Logs and temp files
+*.log
+*.tmp
 *.swp
 *.swo
 
-# Build and distribution artifacts
-build/
+# Editors
+.vscode/
+.idea/
+
+# Build and distribution
 dist/
-*.egg
-*.egg-info/
-*.so
-*.dylib
-*.dll
-*.exe
-*.out
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-.hypothesis/
-
-# Compressed files
+build/
+target/
+*.tar.gz
 *.zip
 *.gz
 *.tar
@@ -67,8 +50,26 @@ dist/
 *.Z
 *.lz
 *.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python specific
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage*
+nosetests.xml
 ```

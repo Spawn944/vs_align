@@ -21,6 +21,7 @@ from functools import partial
 from .rife.IFNet_HDv3_v4_14_align import IFNet
 from .xfeat.xfeat_align import XFeat, gen_grid
 from .enums import SpatialPrecision, Device
+from .fft_align import estimate_shift_fft, apply_shift_tensor
 
 core = vs.core
 
@@ -48,9 +49,10 @@ def calculate_padding(height, width, modulus):
 
 
 def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False, 
-            device="cuda", compensate=False):
+            device="cuda", compensate=False, fft_prepass=True, fft_max_shift=100, 
+            fft_confidence_threshold=3.0):
     """
-    Spatial alignment using RIFE optical flow and optional XFeat homography.
+    Spatial alignment using FFT phase correlation, RIFE optical flow, and optional XFeat homography.
     
     Parameters
     ----------
@@ -72,6 +74,15 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
         Enable RIFE self-bias compensation. May add noise on some content.
         Test both True/False on your specific content for best results.
         Default is False as compensation often adds more noise than it removes.
+    fft_prepass : bool
+        Enable FFT phase correlation pre-pass for exact global translation alignment.
+        Handles pure X/Y shifts mathematically before deep learning refinement.
+        Recommended for DVD→BD alignment with crop offsets. Default is True.
+    fft_max_shift : int
+        Maximum pixel shift to search for in FFT pre-pass. Default is 100.
+    fft_confidence_threshold : float
+        Confidence threshold for FFT shift acceptance. Shifts with confidence
+        below this value are ignored. Default is 3.0. Typical values: >5.0 good, <2.0 risky.
     """
 
     # checks
@@ -158,6 +169,26 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
                 else:
                     fmask = fmask_last # use cached last frame if mask clip is too short or just one frame
 
+            # FFT phase correlation pre-pass for exact global translation
+            fft_shift_applied = False
+            fft_shift_y, fft_shift_x = 0.0, 0.0
+            if fft_prepass:
+                # Convert to numpy for FFT processing (use luma channel only for robustness)
+                fclip_np = fclip[0, 0].cpu().numpy()  # (H, W)
+                fref_np = fref[0, 0].cpu().numpy()    # (H, W)
+                
+                # Estimate shift
+                shift_y, shift_x, confidence = estimate_shift_fft(
+                    fref_np, fclip_np, 
+                    max_shift=fft_max_shift
+                )
+                
+                # Apply shift if confidence exceeds threshold
+                if confidence >= fft_confidence_threshold:
+                    fft_shift_y, fft_shift_x = shift_y, shift_x
+                    fclip = apply_shift_tensor(fclip, shift_y, shift_x)
+                    fft_shift_applied = True
+
             # homography alignment with xfeat and cv2
             wide_search_success = False  # Track whether homography warp was successfully applied
             if wide_search:
@@ -239,19 +270,22 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
                     p4 = calculate_padding(fref_h_new, fref_w_new,  8)
             
             # flow based alignment with rife
+            # Pass FFT shift offset to RIFE so it only computes residual flow (avoids double-correction)
+            fft_offset_for_rife = (fft_shift_y, fft_shift_x) if fft_shift_applied else None
+            
             with torch.amp.autocast(device, enabled=fp16):
                 if   precision == 1:
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=blur, smooth=smooth*3 if smooth>0 else 11, compensate=compensate, device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=blur, smooth=smooth*3 if smooth>0 else 11, compensate=compensate, device=device, fp16=fp16, fft_flow_offset=fft_offset_for_rife)
                 elif precision == 2:
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=9,    smooth=91,     compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=9,    smooth=91,     compensate=False, device=device, fp16=fp16, fft_flow_offset=fft_offset_for_rife)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16, fft_flow_offset=None)  # Only apply FFT offset on first pass
                 elif precision == 3:
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16, fft_flow_offset=fft_offset_for_rife)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16, fft_flow_offset=None)  # Only apply FFT offset on first pass
                 elif precision == 4:
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=2,    smooth=7,      compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s4, p4, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16, fft_flow_offset=fft_offset_for_rife)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=2,    smooth=7,      compensate=False, device=device, fp16=fp16, fft_flow_offset=None)  # Only apply FFT offset on first pass
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s4, p4, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16, fft_flow_offset=None)  # Only apply FFT offset on first pass
                 else:
                     raise ValueError("vs_align.spatial: Precision must be 1, 2, 3, or 4.")
                 
