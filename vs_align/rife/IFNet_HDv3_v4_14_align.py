@@ -249,9 +249,10 @@ class IFNet(nn.Module):
         
         # resize flow to fclip's size
         compensated_flow = F.interpolate(compensated_flow, size=(fref_h, fref_w), mode="bilinear", align_corners=False)
-        if fclip_w / fref_w_pad != 1:
-            flow_x = compensated_flow[:, 0:1, :, :] * (float(fclip_w) / fref_w_pad)
-            flow_y = compensated_flow[:, 1:2, :, :] * (float(fclip_h) / fref_h_pad)
+        # Scale flow by ratio of original dimensions (not padded) to correct for padding-induced scale error
+        if fclip_w / fref_w != 1:
+            flow_x = compensated_flow[:, 0:1, :, :] * (float(fclip_w) / fref_w)
+            flow_y = compensated_flow[:, 1:2, :, :] * (float(fclip_h) / fref_h)
             compensated_flow = torch.cat([flow_x, flow_y], dim=1)
         
         # inpaint flow based on mask
