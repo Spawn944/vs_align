@@ -11,13 +11,12 @@ core = vs.core
 
 # generates a list of frame numbers that need to be duplicated to resample ref to clip
 def gen_duplicates(clip_num, clip_den, ref_num, ref_den, clip_length, ref_length):
-    clip_frame_duration = clip_den / clip_num
-    ref_frame_duration = ref_den / ref_num
+    # Use integer arithmetic to avoid floating-point drift in long clips
+    # ref_frame = (clip_frame * clip_den * ref_num) // (clip_num * ref_den)
     duplicates = []
     last_ref_frame = None
     for clip_frame in range(clip_length):
-        clip_time = clip_frame * clip_frame_duration
-        ref_frame = int(clip_time // ref_frame_duration)
+        ref_frame = (clip_frame * clip_den * ref_num) // (clip_num * ref_den)
         if ref_frame >= ref_length:
             break
         if ref_frame == last_ref_frame:
@@ -231,7 +230,7 @@ def topiq(clip, ref, out, tr, fallback, thresh, device, fp16, batch_size, debug)
     return core.std.ModifyFrame(out, clips=[clip, out, shifted, ref], selector=_frame_match)
 
 
-def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.0, clip_num=None, clip_den=None, ref_num=None, ref_den=None, batch_size=None, device="cuda", debug=False):
+def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=None, clip_num=None, clip_den=None, ref_num=None, ref_den=None, batch_size=None, device="cuda", debug=False):
 
     # convert enums
     if isinstance(device, Device):
@@ -290,6 +289,15 @@ def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.
         out = clip
     if fallback is None:
         thresh = float('inf')
+    elif thresh is None:
+        # Set sensible default threshold based on precision
+        # For precision=3 (TOPIQ), scores are in [0,1] inverted space where lower=better match
+        # thresh=0.70 means fallback when best TOPIQ similarity < 0.30 (reasonable for scene cuts)
+        # For precision=1/2 (PlaneStats/Butteraugli), unbounded scale where lower=better
+        if precision == 3:
+            thresh = 0.70
+        else:
+            thresh = 100.0  # legacy default for PlaneStats/Butteraugli
     if batch_size is None:
         batch_size = tr
     batch_size = batch_size * 2 + 1 # make batch_size scale like tr
@@ -300,7 +308,8 @@ def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.
     
     # if clip's framerate is lower than ref's, resample clip
     if resample_clip:
-        tr = math.ceil(tr * ((ref_num / ref_den) / (clip_num / clip_den))) # make tr higher to compensate for duplicated frames - not the best solution as this makes it slower (todo: find an easy way to skip comparing against duplicated frames instead)
+        # Use integer arithmetic for TR adjustment to avoid floating-point error
+        tr = math.ceil((tr * ref_num * clip_den) // (clip_num * ref_den))
         duplicates = gen_duplicates(ref_num, ref_den, clip_num, clip_den, ref.num_frames, clip.num_frames)
         if duplicates: # if framerates are very close it can happen that no duplicates are generated
             clip = core.std.DuplicateFrames(clip, frames=duplicates)
@@ -332,8 +341,32 @@ def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.
             format_id = vs.RGBS  # topiq fp32
         if clip.format.id != format_id:
             if clip.format.color_family == vs.YUV:
-                clip = core.resize.Point(clip, format=format_id, matrix_in_s="709")
-                ref  = core.resize.Point(ref,  format=format_id, matrix_in_s="709")
+                # Use matrix from frame props if available, otherwise auto-detect based on resolution
+                # SD content (height <= 576) typically uses BT.601, HD uses BT.709
+                # Check _Matrix prop on first frame if available
+                try:
+                    frame0 = clip.get_frame(0)
+                    matrix_prop = frame0.props.get("_Matrix", None)
+                    if matrix_prop is not None:
+                        # _Matrix prop values: 0=RGB, 1=BT.709, 5=BT.601, 6=Unspecified
+                        if matrix_prop == 1:
+                            matrix = "709"
+                        elif matrix_prop == 5:
+                            matrix = "601"
+                        elif matrix_prop == 6 or matrix_prop == 0:
+                            # Unspecified or RGB: use resolution-based default
+                            matrix = "601" if clip.height <= 576 else "709"
+                        else:
+                            # Other matrices: default to resolution-based
+                            matrix = "601" if clip.height <= 576 else "709"
+                    else:
+                        # No _Matrix prop: use resolution-based default
+                        matrix = "601" if clip.height <= 576 else "709"
+                except Exception:
+                    # If get_frame fails, fall back to resolution-based default
+                    matrix = "601" if clip.height <= 576 else "709"
+                clip = core.resize.Point(clip, format=format_id, matrix_in_s=matrix)
+                ref  = core.resize.Point(ref,  format=format_id, matrix_in_s=matrix)
             else:
                 clip = core.resize.Point(clip, format=format_id)
                 ref  = core.resize.Point(ref,  format=format_id)
@@ -377,7 +410,8 @@ def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.
             shifts = [c]
             for cur in range(1, n+1):
                 if forward:
-                    shifts.append(c[cur:]+c[0]*cur)
+                    # Pad forward shift with last frame (not first frame) to avoid false matches at clip end
+                    shifts.append(c[cur:]+c[-1]*cur)
                 if backward:
                     shifts.append(c.std.DuplicateFrames([0]*cur)[:-1*cur])
             return shifts
@@ -392,9 +426,9 @@ def temporal(clip, ref, out=None, precision=1, tr=20, fallback=None, thresh=100.
             scores = [float(diff.props[prop_key]) for diff in f]
             best   = min(indices, key=lambda i: scores[i])
 
-            if fallback and any(score < thresh for score in scores):
-                best_clip = shifts_out[best]
-            elif fallback:
+            # Use fallback only if the BEST match is worse than threshold
+            # min(scores) < thresh means \"is the best match good enough?\"
+            if fallback and min(scores) >= thresh:
                 best_clip = fallback
                 best      = "fallback"
             else:

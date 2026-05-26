@@ -47,7 +47,32 @@ def calculate_padding(height, width, modulus):
     return pad_height, pad_width
 
 
-def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False, device="cuda"):
+def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False, 
+            device="cuda", compensate=False):
+    """
+    Spatial alignment using RIFE optical flow and optional XFeat homography.
+    
+    Parameters
+    ----------
+    clip : vs.VideoNode
+        Source clip to align
+    ref : vs.VideoNode
+        Reference clip to align towards
+    mask : vs.VideoNode, optional
+        Alignment mask (GRAY format)
+    precision : int or SpatialPrecision
+        Alignment precision level (1-4). Higher = more accurate but slower.
+    wide_search : bool
+        Enable XFeat homography pre-alignment for large misalignments
+    lq_input : bool
+        Enable extra blur/smooth for low-quality inputs
+    device : str or Device
+        Processing device ("cuda" or "cpu")
+    compensate : bool
+        Enable RIFE self-bias compensation. May add noise on some content.
+        Test both True/False on your specific content for best results.
+        Default is False as compensation often adds more noise than it removes.
+    """
 
     # checks
     if isinstance(device, Device):
@@ -134,6 +159,7 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
                     fmask = fmask_last # use cached last frame if mask clip is too short or just one frame
 
             # homography alignment with xfeat and cv2
+            wide_search_success = False  # Track whether homography warp was successfully applied
             if wide_search:
                 # detect points
                 fref = F.pad(fref, (4, 4, 4, 4), mode="replicate") # pad to reduce border artifacts
@@ -151,6 +177,7 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
                     match_found = len(idx0) > 50
                     
                     if match_found: # only proceed if there are enough matched points
+                        wide_search_success = True  # Mark successful homography application
                         # find homography from matched points with cv2
                         pts1 = kpts1[idx0].cpu().numpy()
                         pts2 = kpts2[idx1].cpu().numpy()
@@ -195,7 +222,11 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
                         fref  =  fref[:, :, min_y:max_y, min_x:max_x]
                         if fmask is not None:
                             fmask = fmask[:, :, min_y:max_y, min_x:max_x]
-                        
+                
+                # If wide_search failed, remove the padding we added to fref so RIFE receives matching dimensions
+                if not points_found or not (points_found and match_found):
+                    fref = fref[:, :, 4:-4, 4:-4]
+                    
                 # update padding for scales due to bounding box crop and border pad
                 _, _, fref_h_new, fref_w_new = fref.shape
                 if precision == 1 or precision == 2:
@@ -210,24 +241,24 @@ def spatial(clip, ref, mask=None, precision=3, wide_search=False, lq_input=False
             # flow based alignment with rife
             with torch.amp.autocast(device, enabled=fp16):
                 if   precision == 1:
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=blur, smooth=smooth*3 if smooth>0 else 11, compensate=True, device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=blur, smooth=smooth*3 if smooth>0 else 11, compensate=compensate, device=device, fp16=fp16)
                 elif precision == 2:
                     fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s1, p1, blur=9,    smooth=91,     compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=blur, smooth=smooth, compensate=True,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
                 elif precision == 3:
                     fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=blur, smooth=smooth, compensate=True,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
                 elif precision == 4:
                     fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s2, p2, blur=9,    smooth=15,     compensate=False, device=device, fp16=fp16)
                     fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s3, p3, blur=2,    smooth=7,      compensate=False, device=device, fp16=fp16)
-                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s4, p4, blur=blur, smooth=smooth, compensate=True,  device=device, fp16=fp16)
+                    fclip = rife_align(fclip, fref, fmask if fmask is not None else None, s4, p4, blur=blur, smooth=smooth, compensate=compensate,  device=device, fp16=fp16)
                 else:
                     raise ValueError("vs_align.spatial: Precision must be 1, 2, 3, or 4.")
                 
             if wide_search:
-                if points_found and match_found:
+                if wide_search_success:
                     fclip = F.pad(fclip, (min_x, fref_w-max_x, min_y, fref_h-max_y), mode="replicate") # pad what was removed from boundry box crop
-                fclip = fclip[:, :, 4:-4, 4:-4] # crop padding used to reduce border artifacts
+                    fclip = fclip[:, :, 4:-4, 4:-4] # crop padding used to reduce border artifacts (only when homography was applied)
 
             fout = f[1].copy()
             tensor_to_frame(fclip, fout)
